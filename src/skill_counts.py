@@ -19,7 +19,7 @@ import csv
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from skill_dictionary import DEFAULT_DICTIONARY_PATH, SkillDictionary, load_skill_dictionary
+from CareerPath_Ouroboros.src.skill_dictionary import DEFAULT_DICTIONARY_PATH, SkillDictionary, load_skill_dictionary
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_POSTINGS = REPO_ROOT / "synthetic_job_postings.csv"

@@ -28,7 +28,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-from title_roles import (
+from CareerPath_Ouroboros.src.title_roles import (
     DEFAULT_ROLES_PATH,
     ExperienceLevels,
     TitleRoles,

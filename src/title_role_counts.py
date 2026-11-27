@@ -1,191 +1,212 @@
-"""Title role counts: maps raw job titles to standard roles and counts postings per role and level.
+"""Title role counts: gives every posting a standard role and a level, and reports coverage.
 
-Run from the repo root:
+Run from the repo root, after build_title_roles.py:
 
     python src/title_role_counts.py
-    python src/title_role_counts.py --postings path/to/clean.csv --out reports
-    python src/title_role_counts.py --use-existing-mapping
+    python src/title_role_counts.py --postings "data/linkedin_job_postings_2023-2024.csv"
 
-What it does:
-1. Builds the title-to-role mapping from the job titles in the postings
-   (title_roles.discover_roles) and saves it to data/title_roles.csv. Nothing is
-   pre-written. With --use-existing-mapping it reads that CSV as it stands instead,
-   so hand edits (or a mapping built on another dataset) are kept.
-2. Takes each posting's level from the experience level column, falling back to the
-   years in the description (title_roles.ExperienceLevels).
-3. Writes reports/postings_with_roles.csv (every posting with its role, level and
-   standard title) for later steps to use, and reports/title_role_counts.md.
+    If the first option doesnt work, use the 2nd command.
 
-Counts are postings. Column names are options so other datasets work:
---title-column, --level-column, --description-column.
+Role: looked up in data/title_roles.csv by the cleaned title.
+
+Level, first match wins:
+1. The experience level column (LinkedIn's six levels, mapped in LINKEDIN_LEVELS):
+   Internship and Entry level are Entry (Jr.), Associate is Mid (no prefix),
+   Director and Executive are Senior (Sr.). Mid-Senior level is both, so it is
+   Senior when the title has a senior word or the description asks for 6+ years,
+   and Mid otherwise.
+2. Level words in the title ("Sr.", "Junior", "Lead", ...).
+3. Years in the description: 0-2 Entry, 3-5 Mid, 6+ Senior. The first number that
+   looks like a requirement counts. "18 years of age" and numbers over 30 ("over 95
+   years of experience" about the company) are skipped.
+4. Otherwise the level stays blank.
+
+Writes data/processed/postings_with_roles.csv (every column plus standard_role,
+level and standard_title), reports/title_role_counts.md and reports/unmapped_titles.csv
+(most common unmapped titles with an empty role column to fill in and paste into
+data/reference/title_overrides.csv).
 """
-
-from __future__ import annotations
 
 import argparse
 import csv
+import re
 import sys
 from collections import Counter
 from pathlib import Path
 
-from CareerPath_Ouroboros.src.title_roles import (
-    DEFAULT_ROLES_PATH,
-    ExperienceLevels,
-    TitleRoles,
-    discover_roles,
-    load_title_roles,
-    write_title_roles,
-)
+from build_title_roles import DEFAULT_MAPPING, title_key
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_POSTINGS = REPO_ROOT / "synthetic_job_postings.csv"
-DEFAULT_OUT = REPO_ROOT / "reports"
-MIN_ROLES = 15
-TARGET_MAPPED = 0.9
+DEFAULT_POSTINGS = REPO_ROOT / "data" / "processed" / "postings_clean.csv"
+DEFAULT_OUT_FILE = REPO_ROOT / "data" / "processed" / "postings_with_roles.csv"
+DEFAULT_REPORTS = REPO_ROOT / "reports"
+TARGET = 0.9
+
+# edit these to change the rules
+LINKEDIN_LEVELS = {
+    "internship": "Entry",
+    "entry level": "Entry",
+    "associate": "Mid",
+    "mid-senior level": "Mid-Senior",
+    "director": "Senior",
+    "executive": "Senior",
+}
+MAX_YEARS = 30  # a bigger number is the company's age, not a requirement
+YEARS = re.compile(r"(\d+)\s*(?:(?:-|–|to)\s*\d+\s*)?\+?\s*(?:years?|yrs?)\b(?!\s*(?:of age|old))", re.IGNORECASE)
+TITLE_SENIOR_WORDS = {"senior", "sr", "lead", "principal"}
+TITLE_ENTRY_WORDS = {"junior", "jr", "entry", "intern", "internship", "trainee"}
+
+csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
+
+# level -> (prefix, first year count that belongs to it)
+DEFAULT_LEVELS = {"Entry": ("Jr.", 0), "Mid": ("", 3), "Senior": ("Sr.", 6)}
 
 
-def map_postings(
-    rows: list[dict],
-    tr: TitleRoles,
-    lv: ExperienceLevels,
-    title_column: str = "job_title",
-    level_column: str = "experience_level",
-    description_column: str = "description",
-) -> list[dict]:
-    """Return one record per posting: role, level, where the level came from, standard title."""
-    mapped = []
-    for row in rows:
-        title = (row.get(title_column) or "").strip()
-        label = (row.get(level_column) or "").strip()
-        description = row.get(description_column) or ""
+class ExperienceLevels:
+    def __init__(self, levels=None):
+        self.prefixes, self.min_years = {}, {}
+        for level, (prefix, min_years) in (levels or DEFAULT_LEVELS).items():
+            self.prefixes[level] = prefix
+            self.min_years[level] = min_years
 
-        role = tr.find_role(title)
-        level, source = lv.classify(label, description)
-        years_level = lv.from_years(description)
-        mapped.append(
-            {
-                "title": title,
-                "role": role,
-                "level": level,
-                "level_source": source,
-                "level_label": label,
-                "standard_title": lv.title_for(role, level),
-                # the column wins, but it is worth knowing when the description says otherwise
-                "disagrees": source == "column" and years_level is not None and years_level != level,
-            }
-        )
-    return mapped
+    def level_for(self, years):
+        # the highest level whose start is at or below this many years
+        return max((lv for lv in self.min_years if self.min_years[lv] <= years), key=self.min_years.get)
+
+    def title_for(self, role, level):
+        # "Jr. Data Scientist", "Data Scientist" or "Sr. Data Scientist"
+        if not role or not level:
+            return None
+        return " ".join(f"{self.prefixes[level]} {role}".split())
+
+def level_from_title(title):
+    words = re.sub(r"[^a-z0-9 ]", " ", str(title or "").lower()).split()
+    if TITLE_SENIOR_WORDS & set(words):
+        return "Senior"
+    if TITLE_ENTRY_WORDS & set(words):
+        return "Entry"
+    return None
 
 
-def _target_line(roles: int, titles: int) -> str:
-    if roles >= MIN_ROLES:
-        return f"met ({roles} roles)"
-    if titles >= MIN_ROLES:
-        return f"met by standard titles ({titles}), not by roles alone ({roles})"
-    return f"not met ({roles} roles, {titles} standard titles)"
+def level_from_years(description, lv):
+    # level for the first plausible "N years" in the description, or None
+    for m in YEARS.finditer(str(description or "")):
+        years = int(m.group(1))
+        if years <= MAX_YEARS:
+            return lv.level_for(years)
+    return None
 
 
-def _markdown(mapped: list[dict], tr: TitleRoles, lv: ExperienceLevels, source: str, mapping_note: str) -> str:
-    total = len(mapped)
-    mapped_n = sum(1 for m in mapped if m["role"])
-    pct = round(100 * mapped_n / total, 1) if total else 0.0
-    sources = Counter(m["level_source"] for m in mapped)
-    titles = {m["standard_title"] for m in mapped if m["standard_title"]}
-    role_level = Counter((m["role"], m["level"]) for m in mapped if m["role"])
-    role_totals = Counter(m["role"] for m in mapped if m["role"])
-    levels = lv.levels
+def resolve_level(label, title, description, lv):
+    # returns (level, where it came from)
+    mapped = LINKEDIN_LEVELS.get(str(label or "").strip().lower())
+    if mapped == "Mid-Senior":
+        senior = level_from_title(title) == "Senior" or level_from_years(description, lv) == "Senior"
+        return ("Senior" if senior else "Mid"), "column"
+    if mapped:
+        return mapped, "column"
+    level = level_from_title(title)
+    if level:
+        return level, "title"
+    level = level_from_years(description, lv)
+    if level:
+        return level, "description"
+    return None, "unknown"
 
+
+def load_mapping(path):
+    # returns {cleaned title: role}, only the titles that have a role
+    with open(path, encoding="utf-8", newline="") as f:
+        return {row["title"]: row["role"] for row in csv.DictReader(f) if row["role"]}
+
+
+def process(postings_path, mapping, lv, out_path, title_col, level_col, desc_col):
+    # one pass over the postings: writes the output file, returns the counts for the report
+    stats = {"total": 0, "mapped": 0, "roles": Counter(), "levels": Counter(), "sources": Counter(), "unmapped": Counter(), "example": {}}
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(postings_path, encoding="utf-8", newline="") as src, out_path.open("w", encoding="utf-8", newline="") as dst:
+        reader = csv.DictReader(src)
+        fields = reader.fieldnames or []
+        if title_col not in fields:
+            raise SystemExit(f"column '{title_col}' not found. Columns are: {', '.join(fields)}. Use --title-column.")
+        for name, option in [(level_col, "--level-column"), (desc_col, "--description-column")]:
+            if name not in fields:
+                print(f"warning: column '{name}' not found, treated as empty ({option})", file=sys.stderr)
+        writer = csv.DictWriter(dst, fieldnames=fields + ["standard_role", "level", "standard_title"])
+        writer.writeheader()
+        for row in reader:
+            title = row.get(title_col) or ""
+            key = title_key(title)
+            role = mapping.get(key, "")
+            level, source = resolve_level(row.get(level_col), title, row.get(desc_col), lv)
+            row["standard_role"] = role
+            row["level"] = level or ""
+            row["standard_title"] = lv.title_for(role, level) or ""
+            writer.writerow(row)
+
+            stats["total"] += 1
+            stats["levels"][level or "Unknown"] += 1
+            stats["sources"][source] += 1
+            if role:
+                stats["mapped"] += 1
+                stats["roles"][role] += 1
+            else:
+                stats["unmapped"][key] += 1
+                stats["example"].setdefault(key, title.strip())
+    return stats
+
+
+def write_reports(stats, reports_dir, postings_name):
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    total, mapped = stats["total"], stats["mapped"]
+    share = mapped / total if total else 0
     lines = [
         "# Title role counts",
         "",
-        f"Source: `{source}` ({total} postings). Counts are postings.",
-        f"Role mapping: {mapping_note}",
+        f"Source: `{postings_name}` ({total} postings). Counts are postings.",
         "",
-        f"- Standard roles: **{len(role_totals)}**",
-        f"- Standard titles (role plus level prefix): **{len(titles)}**",
-        f"- At least {MIN_ROLES} standard roles: **{_target_line(len(role_totals), len(titles))}**",
-        f"- Postings mapped to a role: **{mapped_n} of {total} ({pct}%)**, target of {TARGET_MAPPED:.0%} "
-        f"**{'met' if total and mapped_n / total >= TARGET_MAPPED else 'not met'}**",
-        f"- Level from the experience level column: **{sources['column']}**",
-        f"- Level from years in the description (column blank or unrecognized): **{sources['description']}**",
-        f"- Level unknown (no column value, no years): **{sources['unknown']}**",
-        f"- Column level differs from the description's years (column used): **{sum(m['disagrees'] for m in mapped)}**",
+        f"- Standard roles: **{len(stats['roles'])}**",
+        f"- Postings with a role: **{mapped} of {total} ({100 * share:.1f}%)**, target of {TARGET:.0%}: **{'met' if share >= TARGET else 'not met'}**",
+        f"- Distinct unmapped titles: **{len(stats['unmapped'])}**",
         "",
-        "## Role mapping",
+        "## Level source",
         "",
-        "| Role | Raw titles merged into it (postings) |",
-        "|---|---|",
+        "| Source | Postings |",
+        "|---|---:|",
     ]
-    raw = Counter((m["role"], m["title"]) for m in mapped if m["role"])
-    for role, _ in role_totals.most_common():
-        spelled = sorted(((t, n) for (r, t), n in raw.items() if r == role), key=lambda x: (-x[1], x[0]))
-        lines.append(f"| {role} | " + "; ".join(f"{t} ({n})" for t, n in spelled) + " |")
+    lines += [f"| {s} | {n} |" for s, n in stats["sources"].most_common()]
+    lines += ["", "## Levels", "", "| Level | Postings |", "|---|---:|"]
+    lines += [f"| {l} | {n} |" for l, n in stats["levels"].most_common()]
+    lines += ["", "## Most common roles", "", "| Role | Postings |", "|---|---:|"]
+    lines += [f"| {r} | {n} |" for r, n in stats["roles"].most_common(25)]
+    lines += ["", "## Most common unmapped titles", "", "Add these to `data/reference/title_overrides.csv`.", "", "| Title | Postings | Example |", "|---|---:|---|"]
+    top = stats["unmapped"].most_common(25)
+    lines += [f"| {t or '(blank)'} | {n} | {stats['example'][t]} |" for t, n in top]
+    (reports_dir / "title_role_counts.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    header = " | ".join(f"{l} ({lv.prefixes[l] or 'no prefix'})" for l in levels)
-    lines += ["", "## Roles by level", "", f"| Role | {header} | Level unknown | Total |", "|---|" + "---:|" * (len(levels) + 2)]
-    for role, n in role_totals.most_common():
-        cells = " | ".join(str(role_level[(role, l)]) for l in levels)
-        lines.append(f"| {role} | {cells} | {role_level[(role, None)]} | {n} |")
-
-    unrecognized = Counter(m["level_label"] for m in mapped if m["level_label"] and m["level_source"] != "column")
-    if unrecognized:
-        lines += ["", "Experience level values that were not recognized (levels came from the description instead):", ""]
-        lines += [f"- {label}: {n}" for label, n in unrecognized.most_common(10)]
-
-    unmapped = Counter(m["title"] for m in mapped if not m["role"])
-    if unmapped:
-        lines += ["", "Unmapped titles:", "", "| Title | Postings | Closest role |", "|---|---:|---|"]
-        for title, n in unmapped.most_common(25):
-            lines.append(f"| {title or '(blank)'} | {n} | {tr.suggest(title)[0] or '-'} |")
+    with (reports_dir / "unmapped_titles.csv").open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["title", "role", "postings"])  # fill in role, then copy the rows to the overrides file
+        for t, n in stats["unmapped"].most_common(500):
+            if t:
+                writer.writerow([t, "", n])
     return "\n".join(lines) + "\n"
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--postings", type=Path, default=DEFAULT_POSTINGS)
-    parser.add_argument("--roles", type=Path, default=DEFAULT_ROLES_PATH, help="where the role mapping CSV is written")
-    parser.add_argument("--use-existing-mapping", action="store_true", help="read --roles instead of rebuilding it")
-    parser.add_argument("--title-column", default="job_title")
-    parser.add_argument("--level-column", default="experience_level")
+    parser.add_argument("--mapping", type=Path, default=DEFAULT_MAPPING)
+    parser.add_argument("--out-file", type=Path, default=DEFAULT_OUT_FILE)
+    parser.add_argument("--reports", type=Path, default=DEFAULT_REPORTS)
+    parser.add_argument("--title-column", default="title")
+    parser.add_argument("--level-column", default="formatted_experience_level")
     parser.add_argument("--description-column", default="description")
-    parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     args = parser.parse_args(argv)
 
-    with args.postings.open(encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
-        fields = list(reader.fieldnames or [])
-        rows = list(reader)
-
-    if args.title_column not in fields:
-        raise SystemExit(f"column '{args.title_column}' not found. Columns are: {', '.join(fields)}. Use --title-column.")
-    for name, option in [(args.level_column, "--level-column"), (args.description_column, "--description-column")]:
-        if name not in fields:
-            print(f"warning: column '{name}' not found, so it is treated as empty ({option})", file=sys.stderr)
-
-    if args.use_existing_mapping:
-        tr = load_title_roles(args.roles)
-        note = f"read from `{args.roles.name}`"
-    else:
-        entries = discover_roles([r.get(args.title_column) for r in rows])
-        write_title_roles(entries, args.roles)
-        tr = TitleRoles(entries)
-        note = f"built from the postings and saved to `{args.roles.name}`"
-
-    lv = ExperienceLevels()
-    mapped = map_postings(rows, tr, lv, args.title_column, args.level_column, args.description_column)
-
-    args.out.mkdir(parents=True, exist_ok=True)
-    with (args.out / "postings_with_roles.csv").open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fields + ["standard_role", "level", "standard_title"])
-        writer.writeheader()
-        for row, m in zip(rows, mapped):
-            writer.writerow(
-                {**row, "standard_role": m["role"] or "", "level": m["level"] or "", "standard_title": m["standard_title"] or ""}
-            )
-
-    md = _markdown(mapped, tr, lv, args.postings.name, note)
-    (args.out / "title_role_counts.md").write_text(md, encoding="utf-8")
-    print(md)
+    mapping = load_mapping(args.mapping)
+    stats = process(args.postings, mapping, ExperienceLevels(), args.out_file, args.title_column, args.level_column, args.description_column)
+    print(write_reports(stats, args.reports, args.postings.name))
 
 
 if __name__ == "__main__":
